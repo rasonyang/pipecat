@@ -17,6 +17,7 @@ import asyncio
 import logging
 import random
 import struct
+import time
 from typing import Optional, Tuple
 
 import numpy as np
@@ -139,6 +140,7 @@ class RTPSession:
         self._sent = 0
         self._received = 0
         self._last_dtmf_ts = -1
+        self._last_rtp_time: float = 0.0
 
     async def start(self, remote_addr: Tuple[str, int]):
         """Bind UDP socket and prepare for send/receive.
@@ -148,6 +150,7 @@ class RTPSession:
         """
         self._remote_addr = remote_addr
         self._running = True
+        self._last_rtp_time = time.monotonic()
 
         loop = asyncio.get_running_loop()
         self._transport, _ = await loop.create_datagram_endpoint(
@@ -184,6 +187,7 @@ class RTPSession:
             return
 
         self._received += 1
+        self._last_rtp_time = time.monotonic()
 
         # RFC 2833 DTMF
         if self._dtmf_enabled and pt == DTMF_PAYLOAD_TYPE:

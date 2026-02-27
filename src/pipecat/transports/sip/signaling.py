@@ -141,7 +141,12 @@ def build_100_trying(*, invite: SIPMessage) -> bytes:
 
 
 def build_200_ok(
-    *, invite: SIPMessage, local_ip: str, local_port: int, session_id: int, local_sip_port: int = 5060
+    *,
+    invite: SIPMessage,
+    local_ip: str,
+    local_port: int,
+    session_id: int,
+    local_sip_port: int = 5060,
 ) -> bytes:
     """Build a 200 OK response to an INVITE with SDP answer.
 
@@ -188,6 +193,29 @@ def build_200_ok_bye(*, bye: SIPMessage) -> bytes:
         f"To: {bye.to_header}\r\n"
         f"Call-ID: {bye.call_id}\r\n"
         f"CSeq: {bye.cseq}\r\n"
+        f"Content-Length: 0\r\n"
+        f"\r\n"
+    )
+    return response.encode("utf-8")
+
+
+def build_200_ok_options(*, options: SIPMessage) -> bytes:
+    """Build a 200 OK response to an OPTIONS keepalive probe.
+
+    Args:
+        options: The parsed OPTIONS message.
+
+    Returns:
+        Encoded SIP response bytes.
+    """
+    response = (
+        f"SIP/2.0 200 OK\r\n"
+        f"Via: {options.via}\r\n"
+        f"From: {options.from_header}\r\n"
+        f"To: {options.to_header}\r\n"
+        f"Call-ID: {options.call_id}\r\n"
+        f"CSeq: {options.cseq}\r\n"
+        f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"
         f"Content-Length: 0\r\n"
         f"\r\n"
     )

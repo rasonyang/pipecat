@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -42,6 +43,7 @@ from pipecat.transports.sip.signaling import (
     build_100_trying,
     build_200_ok,
     build_200_ok_bye,
+    build_200_ok_options,
     build_bye,
 )
 from pipecat.utils.base_object import BaseObject
@@ -88,8 +90,15 @@ class SIPSession:
     _sip_transport: Any = field(init=False, default=None)
     _sip_addr: Tuple[str, int] = field(init=False, default=("", 0))
 
+    prebuffer_frames: int = 3
+    dtmf_enabled: bool = True
+
     def __post_init__(self):
-        self.rtp_session = RTPSession(local_port=self.local_rtp_port)
+        self.rtp_session = RTPSession(
+            local_port=self.local_rtp_port,
+            prebuffer_frames=self.prebuffer_frames,
+            dtmf_enabled=self.dtmf_enabled,
+        )
         self.stopped_event = asyncio.Event()
         self._stopped = False
         self._bye_sent = False
@@ -207,6 +216,7 @@ class SIPInputTransport(BaseInputTransport):
                 break
             except Exception as e:
                 logger.error("SIP input error: %s", e)
+                await self.push_error(f"SIP input error: {e}", exception=e)
 
     async def _dtmf_loop(self):
         """Pull DTMF digits from RTP session and push as transport messages."""
@@ -219,6 +229,7 @@ class SIPInputTransport(BaseInputTransport):
                 break
             except Exception as e:
                 logger.error("SIP DTMF error: %s", e)
+                await self.push_error(f"SIP DTMF error: {e}", exception=e)
 
 
 class SIPOutputTransport(BaseOutputTransport):
@@ -487,6 +498,8 @@ class SIPServerTransport(BaseObject):
             self._handle_bye(msg, addr)
         elif msg.method == SIPMethod.ACK:
             self._handle_ack(msg, addr)
+        elif msg.method == SIPMethod.OPTIONS:
+            self._handle_options(msg, addr)
         else:
             logger.debug("SIP unhandled method: %s", msg.method)
 
@@ -552,6 +565,8 @@ class SIPServerTransport(BaseObject):
             local_ip=local_ip,
             local_sip_port=self._local_port,
             codec=negotiated_codec,
+            prebuffer_frames=self._params.rtp_prebuffer_frames,
+            dtmf_enabled=self._params.dtmf_enabled,
         )
         session.set_sip_transport(self._transport, addr)
 
@@ -598,6 +613,8 @@ class SIPServerTransport(BaseObject):
         try:
             await session.start_rtp()
             self._create_background_task(self._run_rtp(session))
+            if self._params.rtp_dead_timeout_ms > 0:
+                self._create_background_task(self._rtp_dead_monitor(session, call_transport))
             await self._call_event_handler("on_call_started", call_transport)
         except Exception as e:
             logger.error("Call start error: %s", e)
@@ -609,6 +626,31 @@ class SIPServerTransport(BaseObject):
         try:
             await session.rtp_session.run()
         except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error("RTP send error for call %s: %s", session.call_id, e)
+        # If we exit normally (send loop broke, e.g. OSError), clean up the call
+        if session.call_id in self._active_calls:
+            entry = self._active_calls.get(session.call_id)
+            if entry:
+                _, call_transport = entry
+                await self._call_event_handler("on_call_ended", call_transport)
+            await self._cleanup_call(session.call_id)
+
+    async def _rtp_dead_monitor(self, session: SIPSession, call_transport: SIPCallTransport):
+        """Monitor RTP liveness; teardown call if no packets received within timeout."""
+        timeout_s = self._params.rtp_dead_timeout_ms / 1000
+        poll_interval = min(timeout_s / 2, 1.0)
+        try:
+            while session.call_id in self._active_calls:
+                await asyncio.sleep(poll_interval)
+                elapsed = time.monotonic() - session.rtp_session._last_rtp_time
+                if elapsed >= timeout_s:
+                    logger.warning("RTP dead timeout (%.1fs) for call %s", elapsed, session.call_id)
+                    await self._call_event_handler("on_call_ended", call_transport)
+                    await self._cleanup_call(session.call_id)
+                    return
+        except asyncio.CancelledError:
             pass
 
     async def _ack_timeout(self, call_id: str):
@@ -619,6 +661,12 @@ class SIPServerTransport(BaseObject):
             await self._cleanup_call(call_id)
         except asyncio.CancelledError:
             pass
+
+    def _handle_options(self, msg: SIPMessage, addr: Tuple[str, int]):
+        """Handle OPTIONS: respond 200 OK to keep SBC probes happy."""
+        ok = build_200_ok_options(options=msg)
+        self._transport.sendto(ok, addr)
+        logger.debug("SIP OPTIONS 200 OK sent to %s", addr)
 
     def _handle_bye(self, msg: SIPMessage, addr: Tuple[str, int]):
         """Handle BYE: respond 200 OK, teardown call."""
